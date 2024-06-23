@@ -404,8 +404,8 @@ def find_nearest_data_centers(region_info, data_centers,location_name,change_req
     nearest_df = pd.DataFrame(nearest_dc_list)
     
     # Add the DNS server information as new rows with the 'DNS server' header
-    # dns_info = {'Region': '', 'country': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': '185.46.212.97'}
-    dns_info = {'Region': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': '185.46.212.97'}
+    # dns_info = {'Region': '', 'country': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': 'x.x.x.x'}
+    dns_info = {'Region': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': 'x.x.x.x'}
     #nearest_df = nearest_df.append(dns_info, ignore_index=True)
     nearest_df = pd.concat([nearest_df, pd.DataFrame([dns_info])], ignore_index=True)
     dns_info['DNS server'] = '185.46.212.98'
