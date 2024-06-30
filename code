@@ -1,0 +1,743 @@
+# Knowledge Base (KB) and README:
+
+# Purpose:
+# The script is designed to automate the process of setting up Zscaler locations with associated static IP addresses and VPN credentials. It reads data from an Excel file, interacts with the Zscaler API to create records, and finds the nearest data centers based on geographical coordinates.
+
+#  Requirements:
+# - Python 3.x
+# - `requests` library for making API calls
+# - `pandas` library for data manipulation
+# - `geopy` library for calculating distances
+# - `openpyxl` library if dealing with `.xlsx` files
+# - Access to Zscaler API with valid credentials
+
+#  Usage:
+# 1. Place the script in a directory with the Excel file containing the necessary data.
+# 2. Ensure that the Zscaler API credentials are set as environment variables or hardcoded in the script.
+# 3. Run the script. It will prompt you to select the required files and proceed with the operations.
+
+#  Steps to Execute:
+# 1. Open a terminal or command prompt.
+# 2. Navigate to the directory containing the script.
+# 3. Run the script using the command `python script_name.py`.
+# 4. Follow the on-screen prompts to select files and perform operations.
+
+
+#  README:
+
+#  Script Name:
+# Zscaler Location Setup Script
+
+#  Description:
+# This script automates the creation of Zscaler locations with static IP addresses and VPN credentials. It reads from an Excel file, interacts with the Zscaler API, and identifies the nearest data centers based on geographical coordinates.
+
+#  How to Run:
+# 1. Ensure Python 3.x and required libraries are installed.
+# 2. Set Zscaler API credentials as environment variables.
+# 3. Place the script in the same directory as the Excel file.
+# 4. Run the script using `python script_name.py`.
+# 5. Select the required files when prompted.
+
+#  File Selection:
+# The script will prompt you to select:
+# - Excel file with location data.
+# - Text file with the pre-shared key.
+# - JSON file with data center information.
+
+#  Output:
+# - The script will create Zscaler locations and associated records.
+# - It will generate CSV files with the nearest data center information.
+
+#  Notes:
+# - The script logs important information for debugging purposes.
+# - Ensure that the Excel file follows the required format with specific sheets and columns.
+
+
+#python.exe -m pip install --upgrade pip
+#pip install colorama
+#pip install glob
+#
+
+
+import requests
+import time
+import pandas as pd
+from datetime import datetime
+import warnings
+import logging
+import requests.exceptions
+import os
+import json
+from geopy.distance import geodesic
+import socket
+import glob
+import shutil
+import colorama
+from colorama import Fore, Style 
+
+# Suppress openpyxl data validation warning
+warnings.filterwarnings("ignore", message="Data Validation extension is not supported and will be removed")
+
+current_directory = os.getcwd()
+# # Zscaler API credentials
+# ZSCALER_USERNAME = os.environ.get('ZSCALER_USERNAME_P')
+# ZSCALER_PASSWORD = os.environ.get('ZSCALER_PASSWORD_P')
+# ZSCALER_API_KEY = os.environ.get('ZSCALER_API_KEY_P')
+# ZSCALER_BASE_URL = 'https://zsapi.zscaler.net/api/v1'
+
+# Zscaler API Pre prod credentials
+ZSCALER_USERNAME = os.environ.get('ZSCALER_USERNAME_PP')
+ZSCALER_PASSWORD = os.environ.get('ZSCALER_PASSWORD_PP')
+ZSCALER_API_KEY = os.environ.get('ZSCALER_API_KEY_PP')
+ZSCALER_BASE_URL = 'https://zsapi.zscalerthree.net/api/v1'
+
+# Check if the environment variables are set
+if not all([ZSCALER_USERNAME, ZSCALER_PASSWORD, ZSCALER_API_KEY]):
+    raise ValueError("One or more Zscaler API credentials are not set as environment variables.")
+
+# Define the function to list files with a specific extension and allow the user to select one
+def list_files_and_select(directory, extension, description):
+    # List all files with the given extension in the directory
+    files = glob.glob(os.path.join(directory, f'*.{extension}'))
+    files.sort(key=os.path.getctime)  # Sort files by creation time, ascending order
+
+    # Check if there are any files with the given extension
+    if not files:
+        print(f"No {description} files found in the directory.")
+        return None
+
+    # Display the list of files to the user
+    print(f"Please select the {description} file to use:")
+    for idx, file in enumerate(files, start=1):
+        print(f"{idx}. {os.path.basename(file)}")
+
+    # Prompt the user to select a file
+    while True:
+        try:
+            selection = int(input(f"Enter the number of the {description} file (e.g., 1, 2, ...): "))
+            if 1 <= selection <= len(files):
+                selected_file = files[selection - 1]
+                print(f"Selected {description} file: {selected_file}")
+                return selected_file
+            else:
+                print("Invalid selection. Please try again.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+# Define the validation function
+def validate_excel_file(file_name):
+    # Check if the file exists
+    if not os.path.isfile(file_name):
+        print(f"File {file_name} does not exist.")
+        return False
+
+    # Validate file extension
+    if not (file_name.endswith('.xlsx') or file_name.endswith('.xls')):
+        print(f"File {file_name} is not an Excel file.")
+        return False
+
+    try:
+        # Load the Excel file
+        xls = pd.ExcelFile(file_name)
+
+        # Check for the presence of required sheets
+        required_sheets = ['Instruction', 'IPSec_Tunnel', 'Bandwidth_Control']
+        if not all(sheet in xls.sheet_names for sheet in required_sheets):
+            print("Excel file does not contain all the required sheets.")
+            return False
+
+        # Validate IPSec_Tunnel sheet
+        df_ipsec = pd.read_excel(xls, 'IPSec_Tunnel')
+        required_columns_ipsec = [
+            'Change_Request', 'CTASK', 'Country', 'City', 'Site_code',
+            'SDWAN_IPSec_Peer_IP', 'SDWAN_Router_Name', 'Time_Zone'
+        ]
+        if not all(column in df_ipsec.columns for column in required_columns_ipsec):
+            print("IPSec_Tunnel sheet does not contain all the required columns.")
+            return False
+
+        # Check for missing values in required columns of the first row of IPSec_Tunnel
+        first_row = df_ipsec.iloc[0]  # Get the first row
+        for column in required_columns_ipsec:
+            if pd.isnull(first_row[column]):
+                print(f"Missing value in IPSec_Tunnel sheet, first row, column '{column}'.")
+                return False
+
+        # Log missing values in required columns of the second row of IPSec_Tunnel (if it exists)
+        if len(df_ipsec.index) > 1:  # Check if there is a second row
+            second_row = df_ipsec.iloc[1]  # Get the second row
+            for column in required_columns_ipsec:
+                if pd.isnull(second_row[column]):
+                    print(f"Missing value in IPSec_Tunnel sheet, second row, column '{column}'.")
+
+        # Validate Bandwidth_Control sheet
+        df_bandwidth = pd.read_excel(xls, 'Bandwidth_Control')
+        required_columns_bandwidth = ['Upload_Limit(Mbps)', 'Download_Limit(Mbps)']
+        if not all(column in df_bandwidth.columns for column in required_columns_bandwidth):
+            print("Bandwidth_Control sheet does not contain all the required columns.")
+            return False
+
+        # Check for missing values in required columns of Bandwidth_Control
+        for index, row in df_bandwidth.iterrows():
+            for column in required_columns_bandwidth:
+                if pd.isnull(row[column]):
+                    print(f"Missing value in Bandwidth_Control sheet, row {index + 1}, column '{column}'.")
+                    return False
+
+        print("Excel file validation passed.")
+        return True
+
+    except Exception as e:
+        print(f"An error occurred while reading the Excel file: {e}")
+        return False
+    
+# Define the function to check and read a text file containing a password
+def read_password_file(file_path):
+    if os.path.isfile(file_path) and file_path.endswith('.txt'):
+        logging.info(f"Reading password file: {file_path}")
+        with open(file_path, 'r') as file:
+            password = file.read().strip()  # Read and strip any leading/trailing whitespace
+        return password
+    else:
+        logging.error(f"Password file not found or is not a text file: {file_path}")
+        print(f"Password file not found or is not a text file: {file_path}")  # Print major status to the screen
+        exit(1)  # Exit the script with a non-zero status to indicate failure
+
+# Define the function to check and read a JSON file
+def read_json_file(file_path):
+    if os.path.isfile(file_path) and file_path.endswith('.json'):
+        logging.info(f"Reading JSON file: {file_path}")
+        with open(file_path, 'r') as file:
+            data = json.load(file)  # Load JSON content into a dictionary
+        return data
+    else:
+        logging.error(f"JSON file not found or is not a JSON file: {file_path}")
+        print(f"JSON file not found or is not a JSON file: {file_path}")  # Print major status to the screen
+        exit(1)  # Exit the script with a non-zero status to indicate failure
+
+# Function to obfuscate the API key
+def obfuscate_api_key(api_key, timestamp):
+    high = timestamp[-6:]
+    low = str(int(high) >> 1)
+    obfuscated_api_key = ''
+
+    while len(low) < 6:
+        low = '0' + low
+
+    for i in high:
+        obfuscated_api_key += api_key[int(i)]
+    
+    for j in low:
+        obfuscated_api_key += api_key[int(j) + 2]
+
+    return obfuscated_api_key
+
+# Function to authenticate and get a session cookie
+def authenticate():
+    timestamp = str(int(time.time() * 1000))  # Current time in milliseconds
+    obfuscated_api_key = obfuscate_api_key(ZSCALER_API_KEY, timestamp)
+    
+    url = f"{ZSCALER_BASE_URL}/authenticatedSession"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+    }
+    payload = {
+        'apiKey': obfuscated_api_key,
+        'username': ZSCALER_USERNAME,
+        'password': ZSCALER_PASSWORD,
+        'timestamp': timestamp
+    }
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code == 200:
+        logging.info("successfully authenticated to Zscaler")
+        return response.cookies
+    else:
+        raise Exception("Authentication failed")
+    
+# Function to activate the saved configuration changes
+def activate_configuration(session_cookies):
+    url = f"{ZSCALER_BASE_URL}/status/activate"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'apiKey': ZSCALER_API_KEY}
+    response = requests.post(url, headers=headers, cookies=session_cookies)
+    if response.status_code == 200:
+        print ()
+        logging.info("Configuration activated")
+        return response.json()
+    else:
+        print (f"Failed to activate configuration: {response.status_code}")
+        raise Exception(f"Failed to activate configuration: {response.status_code} - {response.text}")
+        
+
+# Function to terminate the session
+def terminate_session(session_cookies):
+    url = f"{ZSCALER_BASE_URL}/authenticatedSession"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'apiKey': ZSCALER_API_KEY}
+    response = requests.delete(url, headers=headers, cookies=session_cookies)
+    if response.status_code == 200:
+        logging.info("Session terminated")
+        print("Session terminated")
+    else:
+        raise Exception(f"Failed to terminate session: {response.status_code} - {response.text}")
+
+# Function to validate a static IP address
+def validate_static_ip(ip_address, session_cookies):
+    url = f"{ZSCALER_BASE_URL}/staticIP/validate"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'apiKey': ZSCALER_API_KEY}
+    payload = {'ipAddress': ip_address}
+    try:
+        response = requests.post(url, json=payload, headers=headers, cookies=session_cookies)
+        
+        if response.status_code == 409:
+            # Conflict error, likely a duplicate IP
+            validation_result = response.json()
+            error_message = validation_result.get('message', 'Conflict with existing IP')
+            logging.error(f"Validation failed for IP {ip_address}: {error_message}")
+            print(f"Conflict error, likely a duplicate IP {ip_address}")
+            return False
+        
+        response.raise_for_status()  # This will raise an HTTPError if the HTTP request returned an unsuccessful status code other than 409
+        
+        # Check if the response is plain text "SUCCESS"
+        if response.text.strip() == "SUCCESS":
+            logging.info(f"Validation successful for IP {ip_address}: No existing record found.")
+            print(f"Validation successful for IP {ip_address}: No existing record found.")
+            print()
+            return True
+        else:
+            # Attempt to parse JSON response
+            validation_result = response.json()
+            if validation_result.get('code') == 'DUPLICATE_ITEM':
+                error_message = validation_result.get('message', 'Unknown error')
+                logging.error(f"Validation failed for IP {ip_address}: {error_message}")
+                print(f"Validation failed for IP {ip_address}")
+                return False  # Return False if there is a duplicate IP
+            else:
+                logging.error(f"Unexpected JSON response for IP {ip_address}: {validation_result}")
+                return False  # Return False for any other unexpected JSON response
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error validating IP {ip_address}: {e}")
+        raise
+    except ValueError:
+        # This catches the ValueError if response.json() fails to decode the response
+        logging.error(f"Error decoding JSON response for IP {ip_address}: {response.text}")
+        raise
+
+# Define the function to read the 'IPSec_Tunnel' sheet and validate IP addresses
+def validate_ipsec_tunnel_ips(excel_file, session_cookies):
+    # Load the 'IPSec_Tunnel' sheet into a DataFrame
+    df_ipsec = pd.read_excel(excel_file, 'IPSec_Tunnel')
+    
+    # Iterate over the rows in the DataFrame and validate each IP address
+    for index, row in df_ipsec.iterrows():
+        ip_address = row['SDWAN_IPSec_Peer_IP']
+        print(f"Validating IP address: {ip_address}")
+        if not validate_static_ip(ip_address, session_cookies):
+            logging.error(f"IP address validation failed for row {index + 1}: {ip_address}")
+            print(f"IP address validation failed for IP: {ip_address}. Exiting.")
+            return False  # Exit the function with a False result
+    return True  # All IP addresses validated successfully
+
+# Function to create a static IP address
+def create_static_ip(ip_address, comment, session_cookies):
+    url = f"{ZSCALER_BASE_URL}/staticIP"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'apiKey': ZSCALER_API_KEY}
+    payload = {'ipAddress': ip_address,'comment': comment}
+    response = requests.post(url, json=payload, headers=headers, cookies=session_cookies)
+    if response.status_code == 200:
+        print()
+        logging.info(f"Static IP record {ip_address}:{response.text} created successfully")
+        print()
+        return response.json()
+        
+    else:
+        print()
+        print(f"Failed to create static IP: {response.status_code} - {response.text}")
+        print()
+        raise Exception(f"Failed to create static IP: {response.status_code} - {response.text}")
+                
+# Function to create VPN credentials
+def create_vpn_credentials(ip_address, pre_shared_key, comments, session_cookies):
+    url = f"{ZSCALER_BASE_URL}/vpnCredentials"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache'}
+    payload = {'type': 'IP', 'ipAddress': ip_address, 'preSharedKey': pre_shared_key, 'comments': comments}
+    response = requests.post(url, json=payload, headers=headers, cookies=session_cookies)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print()
+        print(f"Failed to create VPN credentials: {response.status_code} - {response.text}")
+        raise Exception(f"Failed to create VPN credentials: {response.status_code} - {response.text}")
+
+# Function to create a location with VPN credentials
+def create_location(name, country, tz, state, ip_addresses, description, session_cookies, up_Bandwidth, dn_Bandwidth, vpn_credentials):
+    print()
+    url = f"{ZSCALER_BASE_URL}/locations"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache'}
+    payload = {
+        'name': name,
+        'country': country,
+        'tz': tz,
+        'state': state,
+        'ipAddresses': ip_addresses,
+        'description': description,
+        'ofwEnabled': True,
+        'profile': 'GUESTWIFI',
+        'upBandwidth': up_Bandwidth,
+        'dnBandwidth': dn_Bandwidth,
+        'vpnCredentials': vpn_credentials # Include VPN credentials in the payload
+    }
+    #logging.info(f"Payload for creating location: {json.dumps(payload, indent=2)}")  # Log the payload
+    response = requests.post(url, json=payload, headers=headers, cookies=session_cookies)
+    #logging.info(f"Location creation response status code: {response.status_code}")
+    logging.info(f"Location creation will be attempted using: {response.text}")
+    if response.status_code in [200, 201]:
+        logging.info(f"Location record created successfully with IP and VPN credentials: {response.status_code}:{response.text}")
+        return response.json()
+    else:
+        # Log detailed error message
+        logging.error(f"An error occurred during location creation: {response.status_code} {response.text}")
+        response.raise_for_status()  # This will raise an HTTPError with detailed info
+
+    #     # Log the payload for debugging
+    # logging.info(f"Payload for creating location: {payload}")
+    # response = requests.post(url, json=payload, headers=headers, cookies=session_cookies)
+    # # Log the full response and status code
+    # logging.info(f"Location creation response: {response.status_code} {response.text}")
+    # if response.status_code == 200 or response.status_code == 201:
+    #     return response.json()
+    # else:
+    #     # Handle unexpected status codes
+    #     response.raise_for_status()
+    # logging.info(f"Payload for creating location: {payload}")
+
+
+# Function to activate the saved configuration changes
+def activate_configuration(session_cookies):
+    url = f"{ZSCALER_BASE_URL}/status/activate"
+    headers = {'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'apiKey': ZSCALER_API_KEY}
+    response = requests.post(url, headers=headers, cookies=session_cookies)
+    if response.status_code == 200:
+        print ()
+        logging.info(f"Configuration activated successfully: {response.status_code}:{response.raw}")
+        return response.json()
+    else:
+        print (f"Failed to activate configuration: {response.status_code}")
+        raise Exception(f"Failed to activate configuration: {response.status_code} - {response.text}")
+    
+# Function to calculate distance using geopy
+def calculate_distance(coord1, coord2):
+    return geodesic(coord1, coord2).kilometers
+
+# Function to find the nearest data centers and write to CSV
+# def find_nearest_data_centers(region_info, json_file_path,location_name,change_request):
+#     with open(json_file_path, 'r') as file:
+#         data_centers = json.load(file)
+def find_nearest_data_centers(region_info, data_centers,location_name,change_request):
+
+    # Dynamically get the first key in the JSON file which should be the cloud name
+    cloud_name = next(iter(data_centers))
+
+    dc_list = []
+    for continent, countries in data_centers[cloud_name].items():
+        for city, dc_entries in countries.items():
+            for dc in dc_entries:
+                if dc['vpn']:  # Check if the 'vpn' key has a value
+                    dc_coord = (float(dc['latitude']), float(dc['longitude']))
+                    ip_coord = (float(region_info['latitude']), float(region_info['longitude']))
+                    distance = calculate_distance(dc_coord, ip_coord)
+                    dc_list.append({
+                        'Region': continent.split(' : ')[1],
+                        # 'country': region_info['countryName'],
+                        'city': city.split(' : ')[1],
+                        'Zscasler_IPSec_Peer_hostname': dc['vpn'],
+                        'Zscasler_IPSec_Peer_IP': resolve_vpn_to_ip(dc['vpn']), 
+                        'distance': distance  # Exclude distance from the output
+                    })
+
+    # Sort the data centers by distance
+    dc_list_sorted = sorted(dc_list, key=lambda x: x['distance'])
+
+    # Take only the first 10 nearest data centers for the nearest cities list
+    nearest_dc_list = dc_list_sorted[:10]
+
+    # Create a DataFrame for the nearest data centers
+    nearest_df = pd.DataFrame(nearest_dc_list)
+    
+    # Add the DNS server information as new rows with the 'DNS server' header
+    # dns_info = {'Region': '', 'country': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': '<Zscaler Zen IP>'}
+    dns_info = {'Region': '', 'city': '', 'Zscasler_IPSec_Peer_hostname': '', 'Zscasler_IPSec_Peer_IP': '', 'DNS server': '<Zscaler Zen IP>'}
+    #nearest_df = nearest_df.append(dns_info, ignore_index=True)
+    nearest_df = pd.concat([nearest_df, pd.DataFrame([dns_info])], ignore_index=True)
+    dns_info['DNS server'] = '185.46.212.98'
+    #nearest_df = nearest_df.append(dns_info, ignore_index=True)
+    nearest_df = pd.concat([nearest_df, pd.DataFrame([dns_info])], ignore_index=True)
+
+
+    # Select only the columns to include in the CSV
+    # columns_to_include = ['Region', 'country', 'city', 'Zscasler_IPSec_Peer_hostname', 'Zscasler_IPSec_Peer_IP', 'DNS server']
+    columns_to_include = ['Region', 'city', 'Zscasler_IPSec_Peer_hostname', 'Zscasler_IPSec_Peer_IP', 'DNS server']
+    nearest_df = nearest_df[columns_to_include]
+
+    # Write the nearest data centers to a CSV file
+    nearest_df.to_csv(f'{location_name}-{change_request}_nearest_data_centers.csv', index=False)
+    print(f"Please find the nearest data centers for cloud {Style.BRIGHT}{Fore.YELLOW} {cloud_name}{Style.RESET_ALL} '{location_name}-{change_request}_nearest_data_centers.csv'")
+    logging.info(f"Data Center details are uploaded to {location_name}-{change_request}_nearest_data_centers.csv'")
+
+    # # Write the full sorted list of data centers to another CSV file, excluding the distance
+    # full_dc_list_df = pd.DataFrame(dc_list_sorted)
+    # full_dc_list_df = full_dc_list_df.drop(columns=['distance'])  # Drop the distance column
+    # full_dc_list_df.to_csv('full_data_centers_list.csv', index=False)
+    # print(f"Full sorted list of data centers for cloud {cloud_name} written to 'full_data_centers_list.csv'")
+
+    # Function to resolve VPN name to IP address
+def resolve_vpn_to_ip(vpn_name):
+    try:
+        ip_address = socket.gethostbyname(vpn_name)
+        return ip_address
+    except socket.error as e:
+        logging.error(f"DNS resolution failed for VPN {vpn_name}: {e}")
+        return None  # Return None or a default value if resolution fails
+    
+def print_location_summary(location_response):
+    # Extract the relevant information
+    #location_id = location_response.get('id', 'N/A')
+    location_name = location_response.get('name', 'N/A')
+    country = location_response.get('country', 'N/A')
+    city = location_response.get('state', 'N/A')
+    ip_addresses = location_response.get('ipAddresses', [])
+    description = location_response.get('description', 'N/A')
+    up_bandwidth = location_response.get('upBandwidth', 'N/A')
+    dn_bandwidth = location_response.get('dnBandwidth', 'N/A')
+    vpn_credentials = location_response.get('vpnCredentials', [])
+
+    # Convert bandwidth from kbps to Mbps
+    up_bandwidth_mbps = f"{float(up_bandwidth) / 1000:.2f}" if up_bandwidth != 'N/A' else 'N/A'
+    dn_bandwidth_mbps = f"{float(dn_bandwidth) / 1000:.2f}" if dn_bandwidth != 'N/A' else 'N/A'
+
+
+    # Format the information into a human-readable string
+    summary = (
+       # f"Location ID: {location_id}\n"
+        f"LocationName: {location_name}\n"
+        f"Country: {country}\n"
+        f"City: {city}\n"
+        f"IP Addresses: {', '.join(ip_addresses)}\n"
+        f"Description: {description}\n"
+        f"Upload Bandwidth (Mbps): {up_bandwidth_mbps}\n"
+        f"Download Bandwidth (Mbps): {dn_bandwidth_mbps}\n"
+        f"VPN Credentials: {', '.join([cred['ipAddress'] for cred in vpn_credentials])}"
+    )
+
+    # Print the summary
+    print(summary)
+
+
+ # Function to configure logging with the custom log file name
+def configure_logging(change_request, location_name, current_directory):
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    log_filename = f"{change_request}-{location_name}-ZscalerIPsec-{timestamp}.log"
+    log_filepath = os.path.join(current_directory, log_filename)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filepath),
+            #logging.StreamHandler()
+        ]
+    )
+   
+
+# Main function
+def main():
+    session_cookies = None
+    try:
+        # Initialize Colorama
+        colorama.init(autoreset=True)
+
+        # Prompt the user to ensure the required files are present
+        print("This script requires the following files in the current directory:")
+        print("1. Excel template.")
+        print("2. Text file with the pre-shared key.")
+        print("3. JSON file with data center information.")
+        print(f"Current directory: {current_directory}")
+        user_input = input("Please ensure these files are present before continuing. Type 'yes' to continue, or 'no' to exit: ").strip().lower()
+        
+        if user_input != 'yes':
+            print("Exiting the script. Please make sure the required files are in the current directory and try again.")
+            return
+
+
+        # File selection and validation
+        selected_excel_file = list_files_and_select(current_directory, 'xlsx', 'Excel') or list_files_and_select(current_directory, 'xls', 'Excel')
+        if not selected_excel_file or not validate_excel_file(selected_excel_file):
+            logging.error("Excel file selection or validation failed. Exiting.")
+            return
+        
+        # Read the 'IPSec_Tunnel' sheet
+        df_ipsec = pd.read_excel(selected_excel_file, 'IPSec_Tunnel')
+        df_bandwidth = pd.read_excel(selected_excel_file,'Bandwidth_Control')
+
+        # Assuming the first row contains the "Location_Name" and "Change_Request"
+        location_name = df_ipsec.at[0, 'Location_Name']
+        change_request = df_ipsec.at[0, 'Change_Request']
+        configure_logging(change_request, location_name, current_directory)
+        logging.info(f"Current working directory: {current_directory}")
+        logging.info("Starting script execution")
+
+
+        selected_password_file = list_files_and_select(current_directory, 'txt', 'Password')
+        if not selected_password_file:
+            logging.error("Password file selection failed. Exiting.")
+            return
+
+        selected_json_file = list_files_and_select(current_directory, 'json', 'JSON')
+        if not selected_json_file:
+            logging.error("JSON file selection failed. Exiting.")
+            return
+
+        # Create a new Excel file with the desired naming format
+        new_file_name = f"{location_name}-{change_request}.xlsx"
+        new_file_path = os.path.join(current_directory, new_file_name)
+        shutil.copy(selected_excel_file, new_file_path)
+        logging.info(f"The selected template is copied and renamed as : {new_file_name}")
+        print(f"The selected template is copied and renamed as : {new_file_name}")
+
+        session_cookies = authenticate()
+        print()
+        if not validate_ipsec_tunnel_ips(selected_excel_file, session_cookies):
+            logging.error("IP address validation failed. Exiting.")
+            return  # Exit the main function gracefully
+        
+        logging.info("All IP addresses in the IPSec_Tunnel sheet have been validated successfully.")
+
+        
+        static_ip_responses = []
+        vpn_credentials_responses = []
+
+        for index, row in df_ipsec.iterrows():
+            ip_address = row['SDWAN_IPSec_Peer_IP']
+            static_ip_ = row['Static_IP_Description']
+
+            # Create the static IP record in Zscaler
+            try:
+                static_ip_response = create_static_ip(ip_address, static_ip_, session_cookies)
+                logging.info(f"Zscaler static IP record created successfully for {ip_address}: {static_ip_response}")
+                print(f"Zscaler static IP record created successfully for {ip_address}")
+                static_ip_responses.append(static_ip_response)
+
+            except Exception as e:
+                logging.error(f"Zscaler static IP record creation failed for {ip_address}: {e}")
+                # If creation fails, log the error.
+                return
+            
+    # Read the pre-shared key from the password file
+        pre_shared_key = read_password_file(selected_password_file)
+
+        # Create VPN credentials for each IP address in the static IP responses
+        for static_ip_response in static_ip_responses:
+            try:
+                ip_address = static_ip_response['ipAddress']
+                # Find the router name in the DataFrame that corresponds to the current IP address
+                router_name = df_ipsec.loc[df_ipsec['SDWAN_IPSec_Peer_IP'] == ip_address, 'SDWAN_Router_Name'].iloc[0]
+                vpn_credentials_response = create_vpn_credentials(ip_address, pre_shared_key, router_name, session_cookies)
+                logging.info(f"Zscaler VPN credentials created successfully for IP {ip_address}: {vpn_credentials_response}")
+                print()
+                print(f"Zscaler VPN credentials created successfully for IP {ip_address}")        
+                # Add the VPN credentials response to the list
+                vpn_credentials_responses.append(vpn_credentials_response)
+            
+            except Exception as e:
+                logging.error(f"An error occurred during VPN credentials creation for IP {ip_address}: {e}")
+                return
+        print()
+        print("Attempting to create Zscaler location record...")             
+        # Read the first row of the Excel file for location details
+        location_name = df_ipsec.at[0, 'Location_Name']
+        country = df_ipsec.at[0, 'Country']
+        tz = df_ipsec.at[0, 'Time_Zone']
+        state = df_ipsec.at[0, 'City'] 
+        description = df_ipsec.at[0, 'Location_Description']
+        up_Bandwidth = int(df_bandwidth.at[0, 'Upload_Limit(Mbps)']*1000)
+        dn_Bandwidth = int(df_bandwidth.at[0, 'Download_Limit(Mbps)']*1000)
+
+        # Prepare the list of IP addresses and VPN credentials for the location record
+        ip_addresses = [response['ipAddress'] for response in static_ip_responses]
+        vpn_credentials = [{
+            'id': response['id'],
+            'type': response['type'],
+            'ipAddress': response['ipAddress']
+        } for response in vpn_credentials_responses]
+
+        # Create a single location record with the collected information
+        try:
+            location_response = create_location(location_name, country, tz, state, ip_addresses, description, session_cookies, up_Bandwidth, dn_Bandwidth, vpn_credentials)
+            print("Location record created successfully and details are below")
+            print()
+            print_location_summary(location_response)
+
+        except Exception as e:
+            logging.error(f"An error occurred during location creation: {e}")
+            return
+        
+        # Activate the configuration once after all changes
+        activation_response = activate_configuration(session_cookies)
+        if activation_response:
+            print(f"Configuration activated successfully")
+
+        # After creating the location, get the longitude and latitude from the first static IP response
+        if static_ip_responses:  # Ensure there is at least one static IP response
+            first_static_ip_info = static_ip_responses[0]  # Assuming the first response is in the list
+            region_info = {
+                'latitude': first_static_ip_info['latitude'],
+                'longitude': first_static_ip_info['longitude']
+            }
+
+            # Path to the JSON file containing data center information
+            json_file_path = selected_json_file  # Use the selected JSON file
+
+            # Read the data center information from the JSON file
+            data_centers_info = read_json_file(json_file_path)
+
+            # Find the nearest data centers and write to CSV
+            print()
+            find_nearest_data_centers(region_info, data_centers_info, location_name, change_request)
+            print()
+
+
+            # Enhanced message with color and bold text using Colorama
+            print("\n" + "="*80)
+            print(f"{Style.BRIGHT}{Fore.YELLOW}ACTION REQUIRED:{Style.RESET_ALL}")
+            print(f"Please review the generated CSV file for accuracy before proceeding.")
+            print(f"You can validate the details against the Zscaler portal at the following link:")
+            print(f"{Style.BRIGHT}{Fore.GREEN}https://config.zscaler.com/zscaler.net/cenr{Style.RESET_ALL}")
+            print(f"This step ensures that the information is correct and up-to-date.")
+            print("="*80 + "\n")
+            # print("\n" + "="*80)
+            # print("ACTION REQUIRED:")
+            # print("Please review the generated CSV file for accuracy before proceeding.")
+            # print("You can validate the details against the Zscaler portal at the following link:")
+            # print("https://config.zscaler.com/zscaler.net/cenr")
+            # print("This step ensures that the information is correct and up-to-date.")
+            # print("="*80 + "\n")
+            print()
+            
+    except requests.exceptions.RequestException as e:
+        logging.error("A network error occurred: %s", e)
+    except ValueError as e:
+        logging.error("A value error occurred: %s", e)
+    except json.JSONDecodeError as e:
+        logging.error("A JSON decode error occurred: %s", e)
+    except Exception as e:
+        logging.exception("An unexpected error occurred: %s", e)
+    finally:
+        if session_cookies:
+            try:
+                terminate_session(session_cookies)
+            except Exception as e:
+                logging.error("Failed to terminate session: %s", e)
+        logging.info("Script execution completed")
+
+
+if __name__ == '__main__':
+    main()
